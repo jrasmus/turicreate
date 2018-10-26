@@ -11,7 +11,7 @@
 #include <sframe/sarray.hpp>
 #include <sframe/sframe.hpp>
 
-// ML-Data Utils/
+// ML-Data Utils
 #include <ml_data/ml_data.hpp>
 #include <ml_data/metadata.hpp>
 #include <util/testing_utils.hpp>
@@ -39,13 +39,9 @@ namespace supervised {
 inline arma::vec get_stderr_from_hessian(
     const arma::mat& hessian) {
   DASSERT_EQ(hessian.n_rows, hessian.n_cols);
-  try {
-    return arma::sqrt(arma::diagvec(arma::inv_sympd(hessian)));
-  } catch (const std::runtime_error&) {
-    arma::vec v(hessian.n_rows);
-    v.fill(arma::datum::nan);
-    return v;
-  }
+  arma::mat I;
+  I.eye(hessian.n_rows, hessian.n_cols);
+  return arma::sqrt(arma::diagvec(arma::inv_sympd(hessian + 1E-8 * I)));
 }
 
 /**
@@ -240,26 +236,6 @@ inline sframe setup_test_data_sframe(const sframe& sf,
 
 
 /**
- * Get the missing value enum from the string. 
- *
- * [in] Missing value action as seen by the user. 
- * \returns Missing value action enum  
- */
-inline ml_missing_value_action get_missing_value_enum_from_string(
-                            const std::string & missing_value_str) {
-
- if (missing_value_str == "error") {
-   return ml_missing_value_action::ERROR;
- } else if (missing_value_str == "impute") {
-   return ml_missing_value_action::IMPUTE;
- } else if (missing_value_str == "none") {
-   return ml_missing_value_action::USE_NAN;
- } else{
-   log_and_throw("Internal error. Missing value type not supported");
- }
-}
-
-/**
  * Fill the ml_data_row with an EigenVector using reference encoding for 
  * categorical variables. Here, the 0"th" category is used as the reference
  * category. 
@@ -361,6 +337,7 @@ inline void check_feature_means_and_variances(
       if (!std::isfinite(stats->mean(i))) {
         error_columns.push_back(col);
         column_with_nan = true;
+        break;
       }
     }
   }
@@ -391,23 +368,6 @@ inline std::vector<std::string> make_evaluation_progress(
       ret.push_back(std::to_string(eval_map.at(k)));
   }
   return ret;
-}
-
-inline std::vector<std::pair<std::string, size_t>> make_printer_header(
-    const std::vector<std::string>& metrics, bool has_validation) {
-
-  std::vector<std::pair<std::string, size_t>> header{
-    {"Iteration", 0}, {"Examples", 8}, {"Elapsed Time", 8}
-  };
-
-  for (const auto& m: metrics) {
-    header.push_back({std::string("Training-") + m, 6});
-    if (has_validation)
-      header.push_back({std::string("Validation-") + m, 6});
-  }
-
-  header.push_back({"Examples/second", 0});
-  return header;
 }
 
 inline std::vector<std::string> make_progress_string(
@@ -452,22 +412,23 @@ inline std::vector<std::pair<std::string, size_t>> make_progress_header(
   }
 
   for (const auto& m: metrics) {
-    header.push_back({std::string("Training-") + m, 6});
+    std::string dm = smodel.get_metric_display_name(m);
+    header.push_back({std::string("Training ") + dm, 6});
     if (has_validation_data) 
-      header.push_back({std::string("Validation-") + m, 6});
+      header.push_back({std::string("Validation ") + dm, 6});
   }
 
   return header;
 }
 
 inline std::vector<std::string> make_progress_row_string(
-    supervised_learning_model_base& smodel, 
-    const ml_data& data, 
+    supervised_learning_model_base& smodel,
+    const ml_data& data,
     const ml_data& valid_data,
     const std::vector<std::string>& stats) {
 
   auto train_eval = std::vector<std::string>();
-  for (auto& kv : smodel.evaluate(data, "train")) { 
+  for (auto& kv : smodel.evaluate(data, "train")) {
     train_eval.push_back(std::to_string(variant_get_value<double>(kv.second)));
   }
 
@@ -483,9 +444,6 @@ inline std::vector<std::string> make_progress_row_string(
   for (const auto& s : stats)
     ret.push_back(s);
 
-  // TODO: Right now the model evaluator decides whether or not to add padding
-  // for missing validation statistics.
-  // bool padding = (valid_data.num_rows() > 0); 
   for (size_t i = 0 ; i < train_eval.size(); ++i) {
     ret.push_back(train_eval[i]);
     if (!valid_eval.empty()) {

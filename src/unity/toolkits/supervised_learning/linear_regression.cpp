@@ -8,6 +8,9 @@
 // ML Data
 #include <ml_data/ml_data.hpp>
 
+// Core ML
+#include <unity/toolkits/coreml_export/linear_models_exporter.hpp>
+
 // Toolkits
 #include <toolkits/supervised_learning/linear_regression_opt_interface.hpp>
 #include <toolkits/supervised_learning/supervised_learning_utils-inl.hpp>
@@ -51,15 +54,6 @@ namespace supervised {
  */
 linear_regression::~linear_regression(){
   lr_interface.reset();
-}
-
-
-
-/**
- * Returns the name of the model.
- */
-std::string linear_regression::name(){
-  return "regression_linear_regression";
 }
 
 /**
@@ -303,6 +297,16 @@ void linear_regression::train(){
   unity_progress->construct_from_sframe(stats.progress_table);
   state["progress"] = to_variant(unity_progress);
 
+  // Compute validation-set stats.
+  if (lr_interface->num_validation_examples() > 0) {
+    // Recycle lvalues from stats to use as out parameters here, now that we're
+    // otherwise done reading from stats.
+    lr_interface->compute_validation_first_order_statistics(
+        stats.solution, stats.gradient, stats.func_value);
+    state["validation_loss"] =  stats.func_value;
+    state["validation_rmse"] =  sqrt((stats.func_value)/examples);
+  }
+
   reg.reset();
   smooth_reg.reset();
 
@@ -412,6 +416,18 @@ size_t linear_regression::get_version() const{
   //  4 -  Version 1.7
   return LINEAR_REGRESSION_MODEL_VERSION;  
 }
+
+std::shared_ptr<coreml::MLModelWrapper> linear_regression::export_to_coreml() {
+
+  std::map<std::string, flexible_type> context_metadata = {
+    {"class", name()},
+    {"version", std::to_string(get_version())},
+    {"short_description", "Linear regression model."}};
+
+  return export_linear_regression_as_model_asset(ml_mdata, coefs,
+                                                 context_metadata);
+}
+
 
 
 } // supervised

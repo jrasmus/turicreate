@@ -28,6 +28,10 @@
 #include <fileio/temp_files.hpp>
 #include <fileio/sanitize_url.hpp>
 
+// CoreML
+#include <unity/toolkits/coreml_export/xgboost_exporter.hpp>
+
+
 // sframe
 #include <sframe/algorithm.hpp>
 #include <unity/lib/unity_sarray.hpp>
@@ -40,11 +44,6 @@
 #include <toolkits/supervised_learning/supervised_learning_utils-inl.hpp>
 #include <unity/toolkits/evaluation/metrics.hpp>
 #include <serialization/serialization_includes.hpp>
-
-#ifdef HAS_DISTRIBUTED
-#include <rpc/dc.hpp>
-#endif
-// xgboost
 
 namespace turi {
 namespace supervised {
@@ -311,11 +310,7 @@ void xgboost_model::_restore_from_checkpoint(const std::string& path) {
 std::vector<float> fast_evaluate(const std::vector<float>& preds,
                                  const learner::MetaInfo& info,
                                  std::vector<xgboost_evalptr>& evaluators) {
-#ifdef HAS_DISTRIBUTED
-  bool distributed = true;
-#else
   bool distributed = false;
-#endif
   std::vector<float> ret;
   for (auto& e : evaluators) {
     float v = e->Eval(preds, info, distributed);
@@ -486,6 +481,7 @@ std::shared_ptr< sarray<flexible_type> > transform_prediction(const std::vector<
                      *sa);
           break;
         }
+      case prediction_type_enum::NA:
       case prediction_type_enum::CLASS:
         {
           sa->set_type(ml_mdata->target_column_type());
@@ -533,6 +529,7 @@ std::shared_ptr< sarray<flexible_type> > transform_prediction(const std::vector<
           turi::copy(max_probability.begin(), max_probability.end(), *sa);
           break;
         }
+      case prediction_type_enum::NA:
       case prediction_type_enum::CLASS_INDEX:
       case prediction_type_enum::CLASS:
         {
@@ -703,11 +700,6 @@ xgboost_model::xgboost_model() {
 }
 
 /**
- * Returns the name of the model.
- */
-std::string xgboost_model::name(void) { return "boosted_trees"; }
-
-/**
  * create ml_data to iterator object
  */
 void xgboost_model::model_specific_init(const ml_data& data,
@@ -751,9 +743,6 @@ void xgboost_model::init_options(const std::map<std::string,flexible_type>& _opt
     auto parsed_metrics = parse_tracking_metric(_opts.at("metric"), this->tracking_metrics, this->is_classifier());
     this->set_tracking_metric(parsed_metrics);
   }
-#ifdef HAS_DISTRIBUTED
-  booster_->SetParam("dsplit", "row");
-#endif
 }
 
 size_t xgboost_model::num_classes() {
@@ -827,10 +816,13 @@ table_printer xgboost_model::_init_progress_printer(bool has_validation_data) {
     {"Iteration", default_column_width},
     {"Elapsed Time", default_column_width}
   };
-  for (auto& metric : tracking_metrics) {
-    progress_header.push_back({"Training-" + metric, metric_column_width});
+  for (const std::string& metric : tracking_metrics) {
+    std::string metric_display_name = get_metric_display_name(metric);
+    progress_header.emplace_back("Training " + metric_display_name,
+                                 metric_column_width);
     if (has_validation_data) {
-      progress_header.push_back({"Validation-" + metric, metric_column_width});
+      progress_header.emplace_back("Validation " + metric_display_name,
+                                   metric_column_width);
     }
   }
   table_printer printer(progress_header);
@@ -1007,7 +999,6 @@ void xgboost_model::train(void) {
     std::vector<float> metrics = fast_evaluate(preds, ptrain->info, tracker.get_evaluators());
     tracker.track_training(iter, metrics);
     if (has_validation_data) {
-      auto& validation_labels = pvalid->info.labels;
       std::vector<float> valid_preds;
       this->xgboost_predict(*pvalid, output_margin, valid_preds, rf_running_rescale_constant);
       metrics = fast_evaluate(valid_preds, pvalid->info, tracker.get_evaluators());
@@ -1025,36 +1016,30 @@ void xgboost_model::train(void) {
       }
     }
 
-#ifdef HAS_DISTRIBUTED
-    // In distributed setting, only the worker 0 does checkpoint
-    auto dc = distributed_control_global::get_instance();
-    if (dc == nullptr || dc->procid() == 0) {
-#endif
-      // Checkpoint model
-      if (!(model_checkpoint_path.empty()) &&
-          (int)options.value("model_checkpoint_interval") != 0 &&
-          (iter + 1) % (int)options.value("model_checkpoint_interval") == 0) {
-        namespace fs = boost::filesystem;
-        fs::path checkpoint_path(model_checkpoint_path);
-        checkpoint_path /= "model_checkpoint_" + std::to_string(iter+1);
-        // Append progress tables
-        if (progress_table->size() == 0) {
-          progress_table->construct_from_sframe(printer.get_tracked_table());
-        } else {
-          auto new_progress_table = std::make_shared<unity_sframe>();
-          new_progress_table->construct_from_sframe(printer.get_tracked_table());
-          progress_table = std::dynamic_pointer_cast<unity_sframe>(progress_table->append(new_progress_table));
-        }
-        _save_training_state(iter,
-                             tracker.get_training_metrics(iter),
-                             tracker.get_validation_metrics(iter),
-                             progress_table,
-                             timer.current_time());
-        _checkpoint(checkpoint_path.string());
+    // Checkpoint model
+    if (!(model_checkpoint_path.empty()) &&
+        (int)options.value("model_checkpoint_interval") != 0 &&
+        (iter + 1) % (int)options.value("model_checkpoint_interval") == 0) {
+
+      namespace fs = boost::filesystem;
+      fs::path checkpoint_path(model_checkpoint_path);
+      checkpoint_path /= "model_checkpoint_" + std::to_string(iter+1);
+      // Append progress tables
+      if (progress_table->size() == 0) {
+        progress_table->construct_from_sframe(printer.get_tracked_table());
+      } else {
+        auto new_progress_table = std::make_shared<unity_sframe>();
+        new_progress_table->construct_from_sframe(printer.get_tracked_table());
+        progress_table = std::dynamic_pointer_cast<unity_sframe>(progress_table->append(new_progress_table));
       }
-#ifdef HAS_DISTRIBUTED
+      _save_training_state(iter,
+                           tracker.get_training_metrics(iter),
+                           tracker.get_validation_metrics(iter),
+                           progress_table,
+                           timer.current_time());
+      _checkpoint(checkpoint_path.string());
     }
-#endif
+
     ++iter;
   }
   printer.print_footer();
@@ -1083,6 +1068,11 @@ void xgboost_model::train(void) {
   trim_boost_learner(booster_);
 }
 
+enum{
+    XGBOOST_WITH_STATS = 1, //output also gain and cover metrics per node
+    XGBOOST_JSON_FORMAT = 2 //use Json format for output
+};
+
 /**
  * Save the training state as model metadata
  */
@@ -1102,14 +1092,12 @@ void xgboost_model::_save_training_state(size_t iteration,
     info["training_" + metric] = training_metrics[i];
     if (validation_metrics.size() > 0) {
       info["validation_" + metric] = validation_metrics[i];
-    } else {
-      info["validation_" + metric] = FLEX_UNDEFINED;
     }
   }
   // Store trees
   utils::FeatMap fmap;
   MakeFeatMap(fmap, this->ml_mdata);
-  std::vector<flexible_type> trees_json = convert_vec_string(booster_->DumpModel(fmap, 2 /** json **/));
+  std::vector<flexible_type> trees_json = convert_vec_string(booster_->DumpModel(fmap, XGBOOST_JSON_FORMAT | XGBOOST_WITH_STATS));
   info["trees_json"] = trees_json;
   info["num_trees"] = trees_json.size();
   add_or_update_state(flexmap_to_varmap(info));
@@ -1152,8 +1140,8 @@ std::shared_ptr< sarray<flexible_type> > xgboost_model::predict(
 
 gl_sarray xgboost_model::fast_predict(
     const std::vector<flexible_type>& test_data,
-    const std::string& output_type,
-    const std::string& missing_value_action) {
+    const std::string& missing_value_action,
+    const std::string& output_type) {
   auto na_enum = get_missing_value_enum_from_string(missing_value_action);
   DMatrixSimple dmat = make_simple_dmatrix(test_data, this->ml_mdata, na_enum);
   auto sa = predict_impl(dmat, output_type);
@@ -1164,8 +1152,8 @@ gl_sarray xgboost_model::fast_predict(
 
 gl_sframe xgboost_model::fast_predict_topk(
     const std::vector<flexible_type>& test_data,
-    const std::string& output_type,
     const std::string& missing_value_action,
+    const std::string& output_type,
     const size_t topk) {
   auto na_enum = get_missing_value_enum_from_string(missing_value_action);
   DMatrixSimple dmat = make_simple_dmatrix(test_data, this->ml_mdata, na_enum);
@@ -1386,19 +1374,7 @@ std::map<std::string, variant_type> xgboost_model::evaluate_impl(
 
 std::shared_ptr<sarray<flexible_type>> xgboost_model::extract_features(
     const sframe& test_data,
-    const std::map<std::string, flexible_type>& _options) {
-
-  // For those that call this function from the C++ side, assume missing 
-  // value action is none.
-  std::string missing_value_action_str = "none";
-  auto it = _options.find("missing_value_action");
-  if (it != _options.end()) {
-    missing_value_action_str = (it->second).get<flex_string>();
-  }
-  ml_missing_value_action missing_value_action = 
-      get_missing_value_enum_from_string(missing_value_action_str);
-
-
+    ml_missing_value_action missing_value_action) {
   std::vector<float> out;
   ml_data data = construct_ml_data_using_current_metadata(
       test_data, missing_value_action);
@@ -1450,7 +1426,7 @@ utils::FeatMap get_index_map_with_escaping(
   char feature_name[256];
   auto to_index_info = [&](char* buf, size_t col, size_t feature_index) {
     size_t index = (metadata->global_index_offset(col) + feature_index);
-    int n = snprintf(buf, 256, format_str, index);
+    TURI_ATTRIBUTE_UNUSED_NDEBUG int n = snprintf(buf, 256, format_str, index);
     DASSERT_GT(n, 0);
     DASSERT_LT(n, 256);
     DASSERT_EQ(buf[n], '\0');
@@ -1741,6 +1717,17 @@ void xgboost_model::load_version(turi::iarchive& iarc, size_t version) {
     state.erase("step_size");
 
   }
+}
+
+std::shared_ptr<coreml::MLModelWrapper> xgboost_model::_export_xgboost_model(bool is_classifier,
+      bool is_random_forest,
+      const std::map<std::string, flexible_type>& context) {
+
+  flex_list tree_fl = this->get_trees().get<flex_list>();
+  std::vector<std::string> trees(tree_fl.begin(), tree_fl.end());
+
+  return export_xgboost_model(ml_mdata, trees, is_classifier, is_random_forest,
+                              context);
 }
 
 }  // namespace xgboost

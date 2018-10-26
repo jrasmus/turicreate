@@ -10,18 +10,22 @@ import os
 import sys
 import unittest
 import turicreate as tc
-from turicreate.toolkits import _image_feature_extractor
 from turicreate.toolkits._main import ToolkitError as _ToolkitError
-from turicreate.toolkits._internal_utils import _mac_ver
+from turicreate.toolkits._internal_utils import (_mac_ver,
+                                                 _raise_error_if_not_sframe,
+                                                 _raise_error_if_not_sarray)
 import tempfile
 from . import util as test_util
 import pytest
 import coremltools
-import numpy as np
 import platform
 
-def _get_data():
+def _get_data(num_examples = 100, label_type = int):
     from PIL import Image as _PIL_Image
+    import numpy as np
+
+    assert(label_type in [str, int])
+
     rs = np.random.RandomState(1234)
     _format = {'JPG': 0, 'PNG': 1, 'RAW': 2, 'UNDEFINED': 3}
 
@@ -46,14 +50,21 @@ def _get_data():
                 _image_data_size=image_data_size)
         return img
 
-    num_examples = 100
     images = []
-    random_labels = [rs.randint(0,5) for i in range(num_examples)]
+    if label_type == int:
+        random_labels = [rs.randint(0,5) for _ in range(num_examples)]
+    else:
+        random_labels = [rs.choice(['a', 'b', 'c', 'd', 'e']) for _ in range(num_examples)]
     for i in range(num_examples):
         img_shape = tuple(rs.randint(100, 1000, size=2)) + (3,)
         img = rs.randint(255, size=img_shape)
-        label = random_labels[i]
+
         # Give a slight color hint about the label
+        if label_type == int:
+            label = int(random_labels[i])
+        else:
+            label = ord(random_labels[i]) - ord('a')
+
         img = (img + [label * 3, 0, -label * 3]).clip(0, 255)
         pil_img = _PIL_Image.fromarray(img, mode='RGB')
         images.append(from_pil_image(pil_img))
@@ -64,14 +75,15 @@ def _get_data():
 
 class ImageClassifierTest(unittest.TestCase):
     @classmethod
-    def setUpClass(self, model='resnet-50', input_image_shape=(3, 224, 224), tol=0.02):
+    def setUpClass(self, model = 'resnet-50', input_image_shape = (3, 224, 224), tol=0.02,
+                   num_examples = 100, label_type = int):
         self.feature = 'awesome_image'
         self.target = 'awesome_label'
         self.input_image_shape = input_image_shape
         self.pre_trained_model = model
         self.tolerance = tol
 
-        self.sf = _get_data()
+        self.sf = _get_data(num_examples = num_examples, label_type = label_type)
         self.model = tc.image_classifier.create(self.sf, target=self.target,
                                                 model=self.pre_trained_model,
                                                 seed=42)
@@ -87,8 +99,7 @@ class ImageClassifierTest(unittest.TestCase):
            'training_time': lambda x: x > 0,
            'input_image_shape': lambda x: x == self.input_image_shape,
            'target': lambda x: x == self.target,
-           'feature_extractor' : lambda x: issubclass(type(x),
-                 _image_feature_extractor.ImageFeatureExtractor),
+           'feature_extractor' : lambda x: callable(x.extract_features),
            'training_loss': lambda x: x > 0,
            'max_iterations': lambda x: x == self.max_iterations,
            'num_features': lambda x: x == self.lm_model.num_features,
@@ -103,36 +114,60 @@ class ImageClassifierTest(unittest.TestCase):
         for a, b in zip(list1, list2):
              self.assertAlmostEqual(a, b, delta = tol)
 
-    @pytest.mark.xfail(rases = _ToolkitError)
     def test_create_with_missing_feature(self):
-        tc.image_classifier.create(self.sf, feature='wrong_feature', target=self.target)
-
-    @pytest.mark.xfail(rases = RuntimeError)
-    def test_create_with_missing_label(self):
-        tc.image_classifier.create(self.sf, feature=self.feature, target='wrong_annotations')
-
-    @pytest.mark.xfail(rases = _ToolkitError)
-    def test_create_with_empty_dataset(self):
-        tc.image_classifier.create(self.sf[:0], target = self.target)
-
-    def test_invalid_num_gpus(self):
-        num_gpus = tc.config.get_num_gpus()
-        tc.config.set_num_gpus(-2)
         with self.assertRaises(_ToolkitError):
-            tc.image_classifier.create(self.sf, target=self.target)
-        tc.config.set_num_gpus(num_gpus)
+            tc.image_classifier.create(self.sf, feature='wrong_feature', target=self.target)
+
+    def test_create_with_missing_label(self):
+        with self.assertRaises(RuntimeError):
+            tc.image_classifier.create(self.sf, feature=self.feature, target='wrong_annotations')
+
+    def test_create_with_empty_dataset(self):
+        with self.assertRaises(_ToolkitError):
+            tc.image_classifier.create(self.sf[:0], target = self.target)
 
     def test_predict(self):
         model = self.model
-        for output_type in ['score', 'probability', 'class']:
-            preds = model.predict(self.sf.head())
+        for output_type in ['class', 'probability_vector']:
+            preds = model.predict(self.sf.head(), output_type=output_type)
+            _raise_error_if_not_sarray(preds)
             self.assertEqual(len(preds), len(self.sf.head()))
 
+    def test_single_image(self):
+        model = self.model
+        single_image = self.sf[0][self.feature]
+        prediction = model.predict(single_image)
+        self.assertTrue(isinstance(prediction, (int, str)))
+        prediction = model.predict_topk(single_image)
+        _raise_error_if_not_sframe(prediction)
+        prediction = model.classify(single_image)
+        self.assertTrue(isinstance(prediction, dict) and 'class' in prediction and 'probability' in prediction)
+
+    def test_sarray(self):
+        model = self.model
+        data = self.sf[self.feature]
+        predictions = model.predict(data)
+        _raise_error_if_not_sarray(predictions)
+        predictions = model.predict_topk(data)
+        _raise_error_if_not_sframe(predictions)
+        predictions = model.classify(data)
+        _raise_error_if_not_sframe(predictions)
+
+    def test_junk_input(self):
+        model = self.model
+        with self.assertRaises(TypeError):
+            predictions = model.predict("junk value")
+        with self.assertRaises(TypeError):
+            predictions = model.predict_topk(12)
+        with self.assertRaises(TypeError):
+            predictions = model.classify("more junk")
+
+    @unittest.skipIf(sys.platform == 'darwin', 'test_export_coreml_with_predict(...) covers this functionality and more')
     def test_export_coreml(self):
         filename = tempfile.mkstemp('bingo.mlmodel')[1]
         self.model.export_coreml(filename)
 
-    @unittest.skipIf(sys.platform != 'darwin', 'Only supported on Mac')
+    @unittest.skipIf(sys.platform != 'darwin', 'Core Ml only supported on Mac')
     def test_export_coreml_with_predict(self):
         filename = tempfile.mkstemp('bingo.mlmodel')[1]
         self.model.export_coreml(filename)
@@ -140,17 +175,17 @@ class ImageClassifierTest(unittest.TestCase):
         coreml_model = coremltools.models.MLModel(filename)
         img = self.sf[0:1][self.feature][0]
         img_fixed = tc.image_analysis.resize(img, *reversed(self.input_image_shape))
-        import PIL
-        pil_img = PIL.Image.fromarray(img_fixed.pixel_data)
+        from PIL import Image
+        pil_img = Image.fromarray(img_fixed.pixel_data)
 
         if _mac_ver() >= (10, 13):
             classes = self.model.classifier.classes
-            ret = coreml_model.predict({self.feature: pil_img}, usesCPUOnly = True)
+            ret = coreml_model.predict({self.feature: pil_img})
             coreml_values = [ret[self.target + 'Probability'][l] for l in classes]
 
             self.assertListAlmostEquals(
                coreml_values,
-               list(self.model.predict(self.sf[0:1], output_type = 'probability_vector')[0]),
+               list(self.model.predict(img_fixed, output_type = 'probability_vector')),
                self.tolerance
             )
 
@@ -161,14 +196,14 @@ class ImageClassifierTest(unittest.TestCase):
 
     def test_predict_topk(self):
         model = self.model
-        for output_type in ['score', 'probability', 'class']:
-            preds = model.predict_topk(self.sf.head())
+        for output_type in ['margin', 'probability', 'rank']:
+            preds = model.predict_topk(self.sf.head(), output_type = output_type)
             self.assertEqual(len(preds), 3 * len(self.sf.head()))
 
-            preds = model.predict_topk(self.sf.head(), k = 5)
+            preds = model.predict_topk(self.sf.head(), k = 5, output_type = output_type)
             self.assertEqual(len(preds), 5 * len(self.sf.head()))
 
-    def test__list_fields(self):
+    def test_list_fields(self):
         model = self.model
         fields = model._list_fields()
         self.assertEqual(set(fields), set(self.fields_ans))
@@ -206,7 +241,7 @@ class ImageClassifierTest(unittest.TestCase):
             print("Get passed")
             self.test_summary()
             print("Summary passed")
-            self.test__list_fields()
+            self.test_list_fields()
             print("List fields passed")
 
 
@@ -215,10 +250,20 @@ class ImageClassifierSqueezeNetTest(ImageClassifierTest):
     def setUpClass(self):
         super(ImageClassifierSqueezeNetTest, self).setUpClass(model='squeezenet_v1.1',
                                                               input_image_shape=(3, 227, 227),
-                                                              tol=0.005)
+                                                              tol=0.005, num_examples = 200)
+
+# TODO: if on skip OS, test negative case
+@unittest.skipIf(_mac_ver() < (10,14), 'VisionFeaturePrint_Screen only supported on macOS 10.14+')
+class VisionFeaturePrintScreenTest(ImageClassifierTest):
+    @classmethod
+    def setUpClass(self):
+        super(VisionFeaturePrintScreenTest, self).setUpClass(model='VisionFeaturePrint_Screen',
+                                                              input_image_shape=(3, 299, 299),
+                                                              tol=0.005, num_examples = 100,
+                                                              label_type = str)
 
 
-@unittest.skipIf(tc.util._num_available_gpus() == 0, 'Requires GPU')
+@unittest.skipIf(tc.util._num_available_cuda_gpus() == 0, 'Requires CUDA GPU')
 @pytest.mark.gpu
 class ImageClassifierGPUTest(unittest.TestCase):
     @classmethod
@@ -247,7 +292,7 @@ class ImageClassifierGPUTest(unittest.TestCase):
         tc.config.set_num_gpus(old_num_gpus)
 
 
-@unittest.skipIf(tc.util._num_available_gpus() == 0, 'Requires GPU')
+@unittest.skipIf(tc.util._num_available_cuda_gpus() == 0, 'Requires CUDA GPU')
 @pytest.mark.gpu
 class ImageClassifierSqueezeNetGPUTest(unittest.TestCase):
     @classmethod

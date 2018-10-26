@@ -21,8 +21,8 @@ from array import array
 
 import os as _os
 
-_lfs = _os.environ['LFS_ROOT']
-mushroom_dataset = _os.path.join(_lfs, 'datasets', 'xgboost','mushroom.csv')
+dirname = _os.path.dirname(__file__)
+mushroom_dataset = _os.path.join(dirname, 'mushroom.csv')
 
 
 _DEFAULT_OPTIONS_REGRESSION = {
@@ -92,6 +92,7 @@ class BoostedTreesRegressionTest(unittest.TestCase):
                 'training_max_error': lambda x: x > 0,
                 'training_time': lambda x: x >= 0,
                 'trees_json': lambda x: isinstance(x, list),
+                'validation_data': lambda x: isinstance(x, tc.SFrame) and len(x) == len(self.dtest),
                 'validation_rmse': lambda x: x > 0,
                 'validation_max_error': lambda x: x > 0,
                 'random_seed': lambda x: x is None,
@@ -234,6 +235,11 @@ class BoostedTreesRegressionTest(unittest.TestCase):
     def test_feature_importance(self):
         sf = self.model.get_feature_importance()
         self.assertEqual(sf.column_names(), ["name", "index", "count"])
+
+    def test_trees_json(self):
+        tree_0_vert_0 = eval(self.model.trees_json[0])['vertices'][0]
+        self.assertEquals(set(tree_0_vert_0.keys()),
+                          set(['name','value_hexadecimal','yes_child','cover','missing_child','no_child','type','id','value','gain']))
 
     def test_list_and_dict_type(self):
         rmse_threshold = 0.2
@@ -386,6 +392,21 @@ def binary_classification_integer_target(cls):
             'model_checkpoint_interval': lambda x: x == 5,
             'model_checkpoint_path': lambda x: x is None,
             'resume_from_checkpoint': lambda x: x is None,
+            'training_auc': lambda x: x > 0,
+            'training_confusion_matrix': lambda x: len(x) > 0,
+            'training_f1_score': lambda x: x > 0,
+            'training_precision': lambda x: x > 0,
+            'training_recall': lambda x: x > 0,
+            'training_report_by_class': lambda x: len(x) > 0,
+            'training_roc_curve': lambda x: len(x) > 0,
+            'validation_data': lambda x: isinstance(x, tc.SFrame) and len(x) == len(cls.dtest),
+            'validation_auc': lambda x: x > 0,
+            'validation_confusion_matrix': lambda x: len(x) > 0,
+            'validation_f1_score': lambda x: x > 0,
+            'validation_precision': lambda x: x > 0,
+            'validation_recall': lambda x: x > 0,
+            'validation_report_by_class': lambda x: len(x) > 0,
+            'validation_roc_curve': lambda x: len(x) > 0,
             }
     cls.fields_ans = cls.get_ans.keys()
 
@@ -748,3 +769,4 @@ class TestStringTarget(unittest.TestCase):
         # Assert
         self.assertEqual(['cat-0', 'cat-1'],
             sorted(list(evaluation['confusion_matrix']['target_label'].unique())))
+
